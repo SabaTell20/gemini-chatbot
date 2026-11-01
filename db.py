@@ -23,7 +23,7 @@ def run_query(sql, values=(), fetch=False):
 
 
 def create_tables():
-    """Create the two tables the first time the app runs."""
+    """Create the three tables the first time the app runs."""
     run_query("""
         CREATE TABLE IF NOT EXISTS messages (
             message_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -45,6 +45,17 @@ def create_tables():
             thinking_tokens INT DEFAULT 0
         )
     """)
+    # NEW: one row per uploaded file (image, pdf or voice memo)
+    run_query("""
+        CREATE TABLE IF NOT EXISTS attachments (
+            attachment_id INT AUTO_INCREMENT PRIMARY KEY,
+            session_id VARCHAR(36) NOT NULL,
+            message_id INT NOT NULL,
+            file_name VARCHAR(255) NOT NULL,
+            mime_type VARCHAR(100) NOT NULL,
+            file_path VARCHAR(500) NOT NULL
+        )
+    """)
 
 
 def save_message(session_id, message, role):
@@ -56,10 +67,30 @@ def save_message(session_id, message, role):
 
 
 def load_messages(session_id):
-    """Get (role, message) for every message of a session, oldest first."""
+    """Get (message_id, role, message) for every message of a session, oldest first.
+    CHANGED: message_id is now included so we can match files to messages."""
     return run_query(
-        "SELECT role, message FROM messages "
+        "SELECT message_id, role, message FROM messages "
         "WHERE session_id = %s AND is_deleted = 0 ORDER BY message_id",
+        (session_id,),
+        fetch=True,
+    )
+
+
+def save_attachment(session_id, message_id, file_name, mime_type, file_path):
+    """NEW: remember that a file belongs to a message. The file itself is on disk."""
+    run_query(
+        "INSERT INTO attachments (session_id, message_id, file_name, mime_type, file_path) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (session_id, message_id, file_name, mime_type, file_path),
+    )
+
+
+def load_attachments(session_id):
+    """NEW: get (message_id, file_name, mime_type, file_path) for every file of a session."""
+    return run_query(
+        "SELECT message_id, file_name, mime_type, file_path FROM attachments "
+        "WHERE session_id = %s ORDER BY attachment_id",
         (session_id,),
         fetch=True,
     )

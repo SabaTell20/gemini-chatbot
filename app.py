@@ -1,103 +1,151 @@
-# app.py - the main chat page. Run with:  streamlit run app.py
+import os
+import uuid
+import streamlit as st
+from google import genai
+from google.genai import types
+import db
+from config import API_KEY, MODEL
 
-import uuid                              # makes unique session ids
-import streamlit as st                   # the web page library
-from google import genai                 # Gemini library
-from google.genai import types           # helper classes for Gemini settings
-import db                                # our MySQL functions (db.py)
-from config import API_KEY, MODEL        # our settings (config.py)
-
-# Keep this prompt the SAME every time so Gemini's implicit caching can reuse it
 SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and simply."
+UPLOAD_FOLDER = "uploads"
+FILE_TYPES = ["png", "jpg", "jpeg", "webp", "pdf", "mp3", "wav", "ogg", "flac", "aac"]
 
-st.set_page_config(page_title="Gemini Chatbot")   # browser tab title
-db.create_tables()                                # make sure the tables exist
-client = genai.Client(api_key=API_KEY)            # connect to Gemini
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+st.set_page_config(page_title="Gemini Chatbot")
+db.create_tables()
+client = genai.Client(api_key=API_KEY)
 
-# Streamlit re-runs this whole file on every click, so we remember things in session_state.
-# If there is no current session yet, start a new one with a random unique id.
+
+def save_file(uploaded_file):
+    extension = os.path.splitext(uploaded_file.name)[1]
+    file_path = os.path.join(UPLOAD_FOLDER, uuid.uuid4().hex + extension)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getvalue())
+    mime_type = uploaded_file.type
+    if mime_type == "audio/mpeg":
+        mime_type = "audio/mp3"
+    return (uploaded_file.name, mime_type, file_path)
+
+
+def show_attachments(files):
+    for file_name, mime_type, file_path in files:
+        if mime_type.startswith("image/"):
+            st.image(file_path, caption=file_name)
+        elif mime_type.startswith("audio/"):
+            st.audio(file_path, format=mime_type)
+        else:
+            st.write("📄 " + file_name)
+
+
+def make_parts(text, files):
+    parts = []
+    for file_name, mime_type, file_path in files:
+        with open(file_path, "rb") as f:
+            parts.append(types.Part.from_bytes(data=f.read(), mime_type=mime_type))
+    parts.append(types.Part(text=text))
+    return parts
+
+
+def stream_text(stream, holder):
+    for chunk in stream:
+        if chunk.usage_metadata:
+            holder["usage"] = chunk.usage_metadata
+        if chunk.text:
+            yield chunk.text
+
+
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 
-# ---------------- SIDEBAR ----------------
 with st.sidebar:
     st.title("Chats")
 
-    if st.button("➕ New chat"):                              # new chat button
-        st.session_state.session_id = str(uuid.uuid4())      # brand new empty session
-        st.rerun()                                           # redraw the page
+    if st.button("➕ New chat"):
+        st.session_state.session_id = str(uuid.uuid4())
+        st.rerun()
 
-    # The three feature switches. They are False (off) until the user turns them on.
     use_search = st.toggle("Google Search", key="use_search")
     use_thinking = st.toggle("Thinking", key="use_thinking")
     use_streaming = st.toggle("Streaming", key="use_streaming")
 
-    st.page_link("pages/Pricing.py", label="💰 Token pricing")   # link to the second page
+    st.page_link("pages/Pricing.py", label="💰 Token pricing")
     st.divider()
 
-    # One row per saved session: a button with its title, and a delete button
     for session_id, title in db.list_sessions():
-        col1, col2 = st.columns([4, 1])                       # wide column + narrow column
-        if col1.button(title, key="open_" + session_id):      # open this session
+        col1, col2 = st.columns([4, 1])
+        if col1.button(title, key="open_" + session_id):
             st.session_state.session_id = session_id
             st.rerun()
-        if col2.button("🗑", key="del_" + session_id):        # soft delete this session
+        if col2.button("🗑", key="del_" + session_id):
             db.delete_session(session_id)
-            if session_id == st.session_state.session_id:     # if we deleted the open one...
-                st.session_state.session_id = str(uuid.uuid4())   # ...start a fresh chat
+            if session_id == st.session_state.session_id:
+                st.session_state.session_id = str(uuid.uuid4())
             st.rerun()
 
-# ---------------- CHAT AREA ----------------
 st.title("Gemini Chatbot")
-session_id = st.session_state.session_id         # shortcut name for the current session
-history = db.load_messages(session_id)           # list of (role, message) from MySQL
+session_id = st.session_state.session_id
+history = db.load_messages(session_id)
 
-for role, message in history:                    # show every old message
-    with st.chat_message(role):                  # role is "user" or "assistant"
+attachments = {}
+for message_id, file_name, mime_type, file_path in db.load_attachments(session_id):
+    if message_id not in attachments:
+        attachments[message_id] = []
+    attachments[message_id].append((file_name, mime_type, file_path))
+
+for message_id, role, message in history:
+    with st.chat_message(role):
+        show_attachments(attachments.get(message_id, []))
         st.write(message)
 
-prompt = st.chat_input("Type your message...")   # the box at the bottom
+chat_input = st.chat_input(
+    "Type a message, attach a file or record a voice memo...",
+    accept_file="multiple",
+    file_type=FILE_TYPES,
+    accept_audio=True,
+)
 
-if prompt:                                       # runs only when the user pressed Enter
+if chat_input:
+    text = chat_input.text or "Please look at the attached file."
+
+    uploaded = list(chat_input.files)
+    if chat_input.audio:
+        uploaded.append(chat_input.audio)
+
+    new_files = []
+    for uploaded_file in uploaded:
+        new_files.append(save_file(uploaded_file))
+
     with st.chat_message("user"):
-        st.write(prompt)                         # show the new question right away
+        show_attachments(new_files)
+        st.write(text)
 
-    # 1. Turn our history into the format Gemini wants (its bot role is called "model")
     contents = []
-    for role, message in history:
+    for message_id, role, message in history:
         gemini_role = "model" if role == "assistant" else "user"
-        contents.append(types.Content(role=gemini_role, parts=[types.Part(text=message)]))
-    contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
+        parts = make_parts(message, attachments.get(message_id, []))
+        contents.append(types.Content(role=gemini_role, parts=parts))
+    contents.append(types.Content(role="user", parts=make_parts(text, new_files)))
 
-    # 2. Build the settings that depend on the switches
-    tools = None                                              # no tools = no Google
+    tools = None
     if use_search:
-        tools = [types.Tool(google_search=types.GoogleSearch())]   # allow Google Search
-    level = "high" if use_thinking else "low"                 # thinking on = high, off = low
+        tools = [types.Tool(google_search=types.GoogleSearch())]
+    level = "high" if use_thinking else "low"
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         tools=tools,
         thinking_config=types.ThinkingConfig(thinking_level=level),
     )
 
-    # 3. Ask Gemini
     try:
         with st.chat_message("assistant"):
-            answer = ""                                       # the full answer will be built here
-            usage = None                                      # token counts will be stored here
-
-            if use_streaming:                                 # STREAMING: show text piece by piece
-                box = st.empty()                              # an empty spot we keep overwriting
+            if use_streaming:
+                holder = {"usage": None}
                 stream = client.models.generate_content_stream(
                     model=MODEL, contents=contents, config=config
                 )
-                for chunk in stream:                          # each chunk is a small piece
-                    if chunk.text:                            # some chunks have no text
-                        answer += chunk.text
-                        box.write(answer)
-                    if chunk.usage_metadata:                  # keep the latest token counts
-                        usage = chunk.usage_metadata
-            else:                                             # NOT STREAMING: wait for everything
+                answer = st.write_stream(stream_text(stream, holder))
+                usage = holder["usage"]
+            else:
                 with st.spinner("Waiting for Gemini..."):
                     response = client.models.generate_content(
                         model=MODEL, contents=contents, config=config
@@ -106,18 +154,18 @@ if prompt:                                       # runs only when the user press
                 usage = response.usage_metadata
                 st.write(answer)
 
-        # 4. Save both messages in MySQL
-        db.save_message(session_id, prompt, "user")
+        user_id = db.save_message(session_id, text, "user")
+        for file_name, mime_type, file_path in new_files:
+            db.save_attachment(session_id, user_id, file_name, mime_type, file_path)
         answer_id = db.save_message(session_id, answer, "assistant")
 
-        # 5. Save the token counts (the "or 0" turns None into 0)
         cached = usage.cached_content_token_count or 0
-        input_tokens = (usage.prompt_token_count or 0) - cached   # prompt count includes cached ones
+        input_tokens = (usage.prompt_token_count or 0) - cached
         output_tokens = usage.candidates_token_count or 0
         thinking_tokens = usage.thoughts_token_count or 0
         db.save_usage(session_id, answer_id, input_tokens, cached, output_tokens, thinking_tokens)
 
-        st.rerun()                                            # redraw so the sidebar shows the new chat
+        st.rerun()
 
-    except Exception as error:                                # if anything fails, show the error
+    except Exception as error:
         st.error(f"Something went wrong: {error}")
